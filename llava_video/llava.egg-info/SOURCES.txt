@@ -20,6 +20,7 @@ llava/model/consolidate.py
 llava/model/llava_arch.py
 llava/model/make_delta.py
 llava/model/utils.py
+llava/model/language_model/__init__.py
 llava/model/language_model/llava_gemma.py
 llava/model/language_model/llava_llama.py
 llava/model/language_model/llava_mistral.py

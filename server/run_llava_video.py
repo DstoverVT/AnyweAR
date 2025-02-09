@@ -1,4 +1,3 @@
-# pip install git+https://github.com/LLaVA-VL/LLaVA-NeXT.git
 from llava_video.llava.model.builder import load_pretrained_model
 from llava_video.llava.mm_utils import (
     get_model_name_from_path,
