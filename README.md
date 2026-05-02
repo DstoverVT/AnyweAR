@@ -7,7 +7,7 @@ Rust workspace for the AnyweAR ingestion and general-memory pipeline.
 - `anywear-server`
   - the server-side ingestion, batching, and general-memory extraction scaffold
 - `anywear-phone-app`
-  - a phone-side Rust client crate and CLI for sending chunk metadata to the server and reading events
+  - a phone-side Rust client crate and CLI for uploading local chunk files to the server and reading events
 
 ## What exists
 
@@ -15,6 +15,9 @@ Rust workspace for the AnyweAR ingestion and general-memory pipeline.
   - stores incoming `30s` chunk metadata
   - returns a completed `2-minute` analysis window once `4` consecutive chunks are present
   - automatically starts background processing for that completed window
+- `POST /chunks/upload`
+  - accepts raw chunk video bytes plus metadata from the phone relay
+  - stores the upload on the server for later Gemini Files API registration
 - `GET /events`
   - lists normalized stored events
 - adjacent matching events are merged in memory across back-to-back windows
@@ -53,7 +56,7 @@ Send chunk records from the phone-side CLI in another terminal:
 cargo run -p anywear-phone-app -- send-chunk \
   --seq 0 \
   --start-ts 2026-04-27T12:00:00Z \
-  --storage-uri file:///tmp/chunk-0.mp4
+  --path /tmp/chunk-0.mp4
 ```
 
 Or create four chunk records directly:
@@ -71,6 +74,9 @@ curl -X POST http://localhost:3000/chunks \
 
 Repeat for `chunk_seq` `1`, `2`, and `3`. The fourth response includes `completed_window.id`.
 
+When `GEMINI_API_KEY` is configured, uploaded `file://` chunks are registered with the Gemini Files
+API during extraction and polled until Gemini marks them active before `generateContent` runs.
+
 List stored events:
 
 ```bash
@@ -86,6 +92,6 @@ cargo run -p anywear-phone-app -- events
 ## Next steps
 
 - replace the in-memory repository with Postgres
-- upload the combined `2-minute` window to object storage or Gemini Files API before extraction
 - replace in-process background tasks with a durable background job runner
 - persist specific-layer jobs linked to general event ids
+- add cleanup and lifecycle management for uploaded local chunk files and Gemini file references

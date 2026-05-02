@@ -5,7 +5,7 @@ This crate is a small Rust client that acts as the phone-side relay for the curr
 It can:
 
 - check server health
-- send individual `30-second` chunk metadata records
+- upload individual `30-second` chunk video files
 - send a whole directory of local video files as sequential chunks
 - fetch stored events from the server
 
@@ -29,7 +29,16 @@ Send one chunk:
 cargo run -p anywear-phone-app -- send-chunk \
   --seq 0 \
   --start-ts 2026-04-27T12:00:00Z \
-  --storage-uri file:///tmp/chunk-0.mp4
+  --path /tmp/chunk-0.mp4
+```
+
+Send one chunk by metadata only when you already have a Gemini-readable URI:
+
+```bash
+cargo run -p anywear-phone-app -- send-chunk \
+  --seq 0 \
+  --start-ts 2026-04-27T12:00:00Z \
+  --storage-uri gs://example/chunk-0.mp4
 ```
 
 Send a directory of chunk files:
@@ -49,6 +58,8 @@ cargo run -p anywear-phone-app -- events
 
 ## Notes
 
-- This crate currently sends chunk metadata only. It does not upload raw video bytes to the server yet.
-- `send-dir` converts local file paths into `file://` URIs before sending them.
+- `send-chunk --path` and `send-dir` upload raw video bytes to `POST /chunks/upload`.
+- The server stores uploaded media locally and, when Gemini is enabled, registers those files with
+  the Gemini Files API during extraction.
+- `send-chunk --storage-uri` is still available for pre-hosted media URIs.
 - Once the fourth chunk in a group arrives, the server automatically starts background processing.

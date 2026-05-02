@@ -7,7 +7,8 @@ edition = "2021"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+mime_guess = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.38", features = ["full"] }
 url = "2.5"

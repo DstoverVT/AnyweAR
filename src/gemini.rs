@@ -5,12 +5,19 @@ use crate::domain::{AnalysisWindow, GeneralEvent};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use mime_guess::MimeGuess;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::time::{sleep, Duration};
+use url::Url;
 
 /// Base URL for the Gemini REST API.
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+/// Poll interval while Gemini processes uploaded video files.
+const FILE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum number of polling attempts before a file is treated as stuck.
+const FILE_POLL_ATTEMPTS: usize = 60;
 
 /// Extracts general memory events from an analysis window.
 #[async_trait]
@@ -125,6 +132,16 @@ impl GeminiExtractor {
         format!("{GEMINI_API_BASE}/models/{}:generateContent", self.model)
     }
 
+    /// Builds the Gemini Files API upload start endpoint.
+    fn files_upload_endpoint(&self) -> String {
+        format!("{GEMINI_API_BASE}/upload/v1beta/files")
+    }
+
+    /// Builds the Gemini Files API get endpoint for a file name such as `files/abc123`.
+    fn file_get_endpoint(&self, file_name: &str) -> String {
+        format!("{GEMINI_API_BASE}/{file_name}")
+    }
+
     /// Builds the text instruction sent alongside the video file references.
     ///
     /// # Arguments
@@ -234,6 +251,152 @@ The window spans from {} to {} and covers chunk sequence numbers {} through {}."
             }
         })
     }
+
+    /// Resolves a stored chunk URI into a Gemini file reference.
+    ///
+    /// Local `file://` URIs are uploaded to Gemini Files API on demand and polled until active.
+    /// Other URIs are assumed to already be Gemini-readable references.
+    async fn resolve_file_data(&self, uri: &str) -> Result<FileData> {
+        let parsed = Url::parse(uri).with_context(|| format!("invalid chunk storage URI {uri}"))?;
+        if parsed.scheme() == "file" {
+            return self.upload_local_file_uri(&parsed).await;
+        }
+
+        Ok(FileData {
+            mime_type: infer_mime_type(uri).to_string(),
+            file_uri: uri.to_string(),
+        })
+    }
+
+    async fn upload_local_file_uri(&self, uri: &Url) -> Result<FileData> {
+        let path = uri
+            .to_file_path()
+            .map_err(|_| anyhow!("failed to convert local file URI into a path: {uri}"))?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("failed to read local chunk {}", path.display()))?;
+        let mime_type = infer_mime_type(path.to_string_lossy().as_ref()).to_string();
+        let display_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("chunk.mp4")
+            .to_string();
+
+        let uploaded = self
+            .upload_file_bytes(bytes, mime_type.clone(), display_name)
+            .await?;
+        let active = self.wait_for_file_active(uploaded).await?;
+
+        Ok(FileData {
+            mime_type: active.mime_type.unwrap_or(mime_type),
+            file_uri: active.uri,
+        })
+    }
+
+    async fn upload_file_bytes(
+        &self,
+        bytes: Vec<u8>,
+        mime_type: String,
+        display_name: String,
+    ) -> Result<GeminiFileMetadata> {
+        let start_response = self
+            .client
+            .post(self.files_upload_endpoint())
+            .header("x-goog-api-key", &self.api_key)
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header(
+                "X-Goog-Upload-Header-Content-Length",
+                bytes.len().to_string(),
+            )
+            .header("X-Goog-Upload-Header-Content-Type", &mime_type)
+            .json(&json!({
+                "file": {
+                    "display_name": display_name,
+                }
+            }))
+            .send()
+            .await
+            .context("failed to start Gemini file upload")?
+            .error_for_status()
+            .context("Gemini file upload start returned an error status")?;
+
+        let upload_url = start_response
+            .headers()
+            .get("x-goog-upload-url")
+            .ok_or_else(|| {
+                anyhow!("Gemini file upload response did not include x-goog-upload-url")
+            })?
+            .to_str()
+            .context("Gemini upload URL header was not valid UTF-8")?
+            .to_string();
+
+        let finalize_response = self
+            .client
+            .post(upload_url)
+            .header("Content-Length", bytes.len().to_string())
+            .header("X-Goog-Upload-Offset", "0")
+            .header("X-Goog-Upload-Command", "upload, finalize")
+            .header("Content-Type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .context("failed to upload bytes to Gemini Files API")?
+            .error_for_status()
+            .context("Gemini file upload finalize returned an error status")?;
+
+        let file: GeminiFileEnvelope = finalize_response
+            .json()
+            .await
+            .context("failed to deserialize Gemini uploaded file metadata")?;
+
+        Ok(file.file)
+    }
+
+    async fn wait_for_file_active(
+        &self,
+        mut file: GeminiFileMetadata,
+    ) -> Result<GeminiFileMetadata> {
+        for _ in 0..FILE_POLL_ATTEMPTS {
+            if file.state_is_active() {
+                return Ok(file);
+            }
+
+            if file.state_is_failed() {
+                return Err(anyhow!(
+                    "Gemini file {} failed processing in state {:?}",
+                    file.name,
+                    file.state
+                ));
+            }
+
+            sleep(FILE_POLL_INTERVAL).await;
+            file = self.fetch_file(&file.name).await?;
+        }
+
+        Err(anyhow!(
+            "Gemini file {} did not become ACTIVE within the polling window",
+            file.name
+        ))
+    }
+
+    async fn fetch_file(&self, file_name: &str) -> Result<GeminiFileMetadata> {
+        let response = self
+            .client
+            .get(self.file_get_endpoint(file_name))
+            .header("x-goog-api-key", &self.api_key)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch Gemini file status for {file_name}"))?
+            .error_for_status()
+            .with_context(|| format!("Gemini file status returned an error for {file_name}"))?;
+
+        let payload: GeminiFileEnvelope = response
+            .json()
+            .await
+            .with_context(|| format!("failed to deserialize Gemini file status for {file_name}"))?;
+        Ok(payload.file)
+    }
 }
 
 /// Request envelope for Gemini `generateContent`.
@@ -277,6 +440,59 @@ struct FileData {
     mime_type: String,
     /// URI for the referenced file.
     file_uri: String,
+}
+
+/// Minimal Gemini file metadata envelope.
+#[derive(Debug, Deserialize)]
+struct GeminiFileEnvelope {
+    /// Uploaded or fetched file metadata.
+    file: GeminiFileMetadata,
+}
+
+/// Gemini file metadata used to poll until the file can be consumed by generateContent.
+#[derive(Debug, Deserialize)]
+struct GeminiFileMetadata {
+    /// Resource name such as `files/abc123`.
+    name: String,
+    /// File URI to pass into `file_data`.
+    uri: String,
+    /// Optional MIME type reported by Gemini.
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+    /// Processing state.
+    state: Option<GeminiFileState>,
+}
+
+impl GeminiFileMetadata {
+    fn state_is_active(&self) -> bool {
+        self.state.as_ref().and_then(GeminiFileState::name) == Some("ACTIVE")
+    }
+
+    fn state_is_failed(&self) -> bool {
+        matches!(
+            self.state.as_ref().and_then(GeminiFileState::name),
+            Some("FAILED" | "CANCELLED")
+        )
+    }
+}
+
+/// Gemini file state representation varies between plain strings and nested objects.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum GeminiFileState {
+    /// State string such as `ACTIVE`.
+    Plain(String),
+    /// Nested form such as `{ "name": "PROCESSING" }`.
+    Named { name: String },
+}
+
+impl GeminiFileState {
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Plain(value) => Some(value.as_str()),
+            Self::Named { name } => Some(name.as_str()),
+        }
+    }
 }
 
 /// Gemini generation configuration for structured JSON output.
@@ -370,18 +586,11 @@ impl GeneralEventExtractor for GeminiExtractor {
         parts.push(Part::Text {
             text: Self::prompt(window),
         });
-        parts.extend(
-            window
-                .chunk_storage_uris
-                .iter()
-                .cloned()
-                .map(|file_uri| Part::FileData {
-                    file_data: FileData {
-                        mime_type: "video/mp4".to_string(),
-                        file_uri,
-                    },
-                }),
-        );
+        for chunk_uri in &window.chunk_storage_uris {
+            parts.push(Part::FileData {
+                file_data: self.resolve_file_data(chunk_uri).await?,
+            });
+        }
 
         let request = GenerateContentRequest {
             contents: vec![Content { parts }],
@@ -435,4 +644,10 @@ impl GeneralEventExtractor for GeminiExtractor {
             })
             .collect())
     }
+}
+
+fn infer_mime_type(uri_or_path: &str) -> &'static str {
+    MimeGuess::from_path(uri_or_path)
+        .first_raw()
+        .unwrap_or("video/mp4")
 }

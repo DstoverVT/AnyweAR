@@ -2,8 +2,9 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::Client;
+use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use url::Url;
 use uuid::Uuid;
 
@@ -90,6 +91,55 @@ impl PhoneAppClient {
             .context("failed to deserialize chunk ingest response")
     }
 
+    /// Uploads a local video file and its chunk metadata to the server.
+    ///
+    /// The server stores the uploaded bytes locally so the backend Gemini pipeline can later
+    /// register them with the Gemini Files API.
+    pub async fn upload_chunk_file(
+        &self,
+        seq: u64,
+        start_ts: DateTime<Utc>,
+        end_ts: DateTime<Utc>,
+        path: &Path,
+    ) -> Result<ChunkIngestResponse> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("chunk.mp4")
+            .to_string();
+        let mime_type = infer_mime_type(path);
+        let file_bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read chunk file {}", path.display()))?;
+
+        let form = multipart::Form::new()
+            .text("seq", seq.to_string())
+            .text("start_ts", start_ts.to_rfc3339())
+            .text("end_ts", end_ts.to_rfc3339())
+            .part(
+                "file",
+                multipart::Part::bytes(file_bytes)
+                    .file_name(file_name)
+                    .mime_str(mime_type)
+                    .context("failed to set upload MIME type")?,
+            );
+
+        let response = self
+            .http
+            .post(self.endpoint("chunks/upload")?)
+            .multipart(form)
+            .send()
+            .await
+            .context("failed to upload chunk file to server")?
+            .error_for_status()
+            .context("chunk upload endpoint returned an error status")?;
+
+        response
+            .json()
+            .await
+            .context("failed to deserialize chunk upload response")
+    }
+
     /// Fetches all stored events from the server.
     ///
     /// # Returns
@@ -134,6 +184,12 @@ impl PhoneAppClient {
             .join(path)
             .with_context(|| format!("failed to build endpoint URL for path {path}"))
     }
+}
+
+fn infer_mime_type(path: &Path) -> &'static str {
+    mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("video/mp4")
 }
 
 /// Request body sent when the phone relay publishes a video chunk.

@@ -25,7 +25,7 @@ struct Cli {
 enum Command {
     /// Checks whether the server is reachable.
     Health,
-    /// Sends one video chunk URI to the server.
+    /// Sends one chunk to the server, either by uploading a local file or by posting metadata.
     SendChunk {
         /// Sequence number for the chunk.
         #[arg(long)]
@@ -33,9 +33,12 @@ enum Command {
         /// Start timestamp for the chunk.
         #[arg(long)]
         start_ts: DateTime<Utc>,
-        /// URI where the chunk media can be read.
-        #[arg(long)]
-        storage_uri: String,
+        /// Local video file to upload to the server.
+        #[arg(long, conflicts_with = "storage_uri")]
+        path: Option<PathBuf>,
+        /// Existing URI where the chunk media can be read.
+        #[arg(long, conflicts_with = "path")]
+        storage_uri: Option<String>,
     },
     /// Sends every video file in a directory as consecutive chunks.
     SendDir {
@@ -74,10 +77,19 @@ async fn main() -> Result<()> {
         Command::SendChunk {
             seq,
             start_ts,
+            path,
             storage_uri,
         } => {
-            let request = build_chunk_request(seq, start_ts, storage_uri);
-            let response = client.send_chunk(request).await?;
+            let response = if let Some(path) = path {
+                client
+                    .upload_chunk_file(seq, start_ts, start_ts + Duration::seconds(30), &path)
+                    .await?
+            } else if let Some(storage_uri) = storage_uri {
+                let request = build_chunk_request(seq, start_ts, storage_uri);
+                client.send_chunk(request).await?
+            } else {
+                anyhow::bail!("send-chunk requires either --path or --storage-uri");
+            };
             print_chunk_result(&response);
         }
         Command::SendDir {
@@ -85,12 +97,13 @@ async fn main() -> Result<()> {
             start_seq,
             start_ts,
         } => {
-            let uris = collect_video_paths(&dir)?;
-            for (index, uri) in uris.into_iter().enumerate() {
+            let paths = collect_video_paths(&dir)?;
+            for (index, path) in paths.into_iter().enumerate() {
                 let seq = start_seq + index as u64;
                 let chunk_start = start_ts + Duration::seconds((index as i64) * 30);
-                let request = build_chunk_request(seq, chunk_start, uri);
-                let response = client.send_chunk(request).await?;
+                let response = client
+                    .upload_chunk_file(seq, chunk_start, chunk_start + Duration::seconds(30), &path)
+                    .await?;
                 print_chunk_result(&response);
             }
         }
@@ -137,7 +150,7 @@ fn build_chunk_request(
     }
 }
 
-/// Collects video file paths from a directory and converts them to file URIs.
+/// Collects video file paths from a directory.
 ///
 /// # Arguments
 ///
@@ -145,13 +158,13 @@ fn build_chunk_request(
 ///
 /// # Returns
 ///
-/// Sorted file URIs for recognized video files in the directory.
+/// Sorted absolute paths for recognized video files in the directory.
 ///
 /// # Errors
 ///
 /// Returns an error if the directory cannot be read, an entry cannot be enumerated, a file cannot be
-/// canonicalized, or a file URI cannot be built.
-fn collect_video_paths(dir: &Path) -> Result<Vec<String>> {
+/// canonicalized.
+fn collect_video_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = std::fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {}", dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -159,7 +172,7 @@ fn collect_video_paths(dir: &Path) -> Result<Vec<String>> {
 
     entries.sort_by_key(|entry| entry.path());
 
-    let mut uris = Vec::new();
+    let mut paths = Vec::new();
     for entry in entries {
         let path = entry.path();
         if !path.is_file() || !is_video_file(&path) {
@@ -169,12 +182,10 @@ fn collect_video_paths(dir: &Path) -> Result<Vec<String>> {
         let absolute = path
             .canonicalize()
             .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-        let uri = Url::from_file_path(&absolute)
-            .map_err(|_| anyhow::anyhow!("failed to build file URI for {}", absolute.display()))?;
-        uris.push(uri.to_string());
+        paths.push(absolute);
     }
 
-    Ok(uris)
+    Ok(paths)
 }
 
 /// Returns whether the path has a recognized video file extension.
