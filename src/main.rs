@@ -1,9 +1,18 @@
+//! HTTP server entry point for ingesting video chunks and extracting memory events.
+
+/// Runtime configuration loading.
 mod config;
+/// API and processing domain types.
 mod domain;
+/// HTTP error conversion.
 mod error;
+/// Gemini and mock event extractors.
 mod gemini;
+/// Axum routing and handlers.
 mod http;
+/// In-memory persistence layer.
 mod repository;
+/// Application service layer.
 mod service;
 
 use crate::config::Config;
@@ -14,6 +23,15 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Starts the AnyweAR HTTP server.
+///
+/// # Returns
+///
+/// `Ok(())` after the server shuts down cleanly.
+///
+/// # Errors
+///
+/// Returns an error if tracing setup, socket binding, or HTTP serving fails.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()

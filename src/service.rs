@@ -1,3 +1,5 @@
+//! Application services that coordinate repository state and event extraction.
+
 use crate::domain::{
     AnalysisWindow, ChunkIngestRequest, ChunkIngestResponse, GeneralEvent, ProcessWindowResponse,
     StoredEvent, VideoChunk,
@@ -10,12 +12,24 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 use uuid::Uuid;
 
+/// Shared application state used by HTTP handlers and background tasks.
 pub struct AppState {
+    /// In-memory persistence for chunks, windows, and extracted events.
     pub repository: Mutex<InMemoryRepository>,
+    /// General event extractor used to analyze completed windows.
     pub extractor: Arc<dyn GeneralEventExtractor>,
 }
 
 impl AppState {
+    /// Creates application state with an empty repository and configured extractor.
+    ///
+    /// # Arguments
+    ///
+    /// * `extractor` - Event extractor implementation used for completed windows.
+    ///
+    /// # Returns
+    ///
+    /// A new [`AppState`] with an empty in-memory repository.
     pub fn new(extractor: Arc<dyn GeneralEventExtractor>) -> Self {
         Self {
             repository: Mutex::new(InMemoryRepository::default()),
@@ -24,6 +38,21 @@ impl AppState {
     }
 }
 
+/// Stores a chunk and returns a completed analysis window when four consecutive chunks are ready.
+///
+/// # Arguments
+///
+/// * `state` - Application state containing the repository to update.
+/// * `request` - Chunk metadata sent by the phone relay.
+///
+/// # Returns
+///
+/// A [`ChunkIngestResponse`] containing the stored chunk and optional completed window.
+///
+/// # Errors
+///
+/// Returns [`AppError::BadRequest`] when the chunk end timestamp is not later than its start
+/// timestamp.
 pub async fn ingest_chunk(
     state: &AppState,
     request: ChunkIngestRequest,
@@ -57,6 +86,16 @@ pub async fn ingest_chunk(
     })
 }
 
+/// Spawns background processing for an already completed analysis window.
+///
+/// # Arguments
+///
+/// * `state` - Shared application state moved into the background task.
+/// * `window_id` - Identifier of the completed analysis window to process.
+///
+/// # Returns
+///
+/// This function returns immediately after spawning the task.
 pub fn spawn_window_processing(state: Arc<AppState>, window_id: Uuid) {
     tokio::spawn(async move {
         match process_window(&state, window_id).await {
@@ -78,6 +117,21 @@ pub fn spawn_window_processing(state: Arc<AppState>, window_id: Uuid) {
     });
 }
 
+/// Runs extraction for a window and persists the resulting stored events.
+///
+/// # Arguments
+///
+/// * `state` - Application state containing the repository and extractor.
+/// * `window_id` - Identifier of the completed analysis window to process.
+///
+/// # Returns
+///
+/// A [`ProcessWindowResponse`] containing the processed window and stored events.
+///
+/// # Errors
+///
+/// Returns [`AppError::NotFound`] if the window ID does not exist, or [`AppError::Internal`] if
+/// event extraction fails.
 pub async fn process_window(
     state: &AppState,
     window_id: Uuid,
@@ -110,11 +164,30 @@ pub async fn process_window(
     })
 }
 
+/// Returns a snapshot of all stored events.
+///
+/// # Arguments
+///
+/// * `state` - Application state containing the repository to read.
+///
+/// # Returns
+///
+/// A cloned vector of all stored events in repository order.
 pub async fn list_events(state: &AppState) -> Vec<StoredEvent> {
     let repo = state.repository.lock().await;
     repo.events().to_vec()
 }
 
+/// Converts a model event into a persisted event tied to its source window.
+///
+/// # Arguments
+///
+/// * `window` - Analysis window that produced the model event.
+/// * `event` - General event returned by the extractor.
+///
+/// # Returns
+///
+/// A [`StoredEvent`] with a new ID and source chunk metadata from the window.
 fn to_stored_event(window: &AnalysisWindow, event: GeneralEvent) -> StoredEvent {
     StoredEvent {
         id: Uuid::new_v4(),

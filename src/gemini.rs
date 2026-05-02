@@ -1,3 +1,5 @@
+//! Gemini-backed and mock implementations of general event extraction.
+
 use crate::config::Config;
 use crate::domain::{AnalysisWindow, GeneralEvent};
 use anyhow::{anyhow, Context, Result};
@@ -7,13 +9,37 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Base URL for the Gemini REST API.
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// Extracts general memory events from an analysis window.
 #[async_trait]
 pub trait GeneralEventExtractor: Send + Sync {
+    /// Produces zero or more general events for a completed video window.
+    ///
+    /// # Arguments
+    ///
+    /// * `window` - Completed analysis window to inspect.
+    ///
+    /// # Returns
+    ///
+    /// A vector of extracted [`GeneralEvent`] values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when extraction cannot complete.
     async fn extract(&self, window: &AnalysisWindow) -> Result<Vec<GeneralEvent>>;
 }
 
+/// Builds the configured event extractor, falling back to a mock extractor without an API key.
+///
+/// # Arguments
+///
+/// * `config` - Runtime configuration containing Gemini credentials and model selection.
+///
+/// # Returns
+///
+/// A boxed [`GeneralEventExtractor`] implementation.
 pub fn build_extractor(config: &Config) -> Box<dyn GeneralEventExtractor> {
     match &config.gemini_api_key {
         Some(api_key) => Box::new(GeminiExtractor::new(
@@ -25,10 +51,24 @@ pub fn build_extractor(config: &Config) -> Box<dyn GeneralEventExtractor> {
     }
 }
 
+/// Deterministic extractor used for local development without Gemini credentials.
 pub struct MockExtractor;
 
 #[async_trait]
 impl GeneralEventExtractor for MockExtractor {
+    /// Returns one low-confidence routine event spanning the whole window.
+    ///
+    /// # Arguments
+    ///
+    /// * `window` - Completed analysis window to cover with the mock event.
+    ///
+    /// # Returns
+    ///
+    /// A single routine [`GeneralEvent`] spanning the full window.
+    ///
+    /// # Errors
+    ///
+    /// The mock implementation currently does not return errors.
     async fn extract(&self, window: &AnalysisWindow) -> Result<Vec<GeneralEvent>> {
         Ok(vec![GeneralEvent {
             start_ts: window.start_ts,
@@ -46,13 +86,28 @@ impl GeneralEventExtractor for MockExtractor {
     }
 }
 
+/// Gemini-backed extractor for first-pass general memory events.
 pub struct GeminiExtractor {
+    /// HTTP client used for Gemini API calls.
     client: Client,
+    /// API key sent in the Gemini request header.
     api_key: String,
+    /// Gemini model identifier.
     model: String,
 }
 
 impl GeminiExtractor {
+    /// Creates a Gemini extractor with an injected HTTP client and model configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - HTTP client used to call Gemini.
+    /// * `api_key` - Gemini API key sent with requests.
+    /// * `model` - Gemini model name used in the request endpoint.
+    ///
+    /// # Returns
+    ///
+    /// A configured [`GeminiExtractor`].
     pub fn new(client: Client, api_key: String, model: String) -> Self {
         Self {
             client,
@@ -61,10 +116,24 @@ impl GeminiExtractor {
         }
     }
 
+    /// Builds the model-specific `generateContent` endpoint URL.
+    ///
+    /// # Returns
+    ///
+    /// Fully qualified Gemini `generateContent` endpoint URL for the configured model.
     fn endpoint(&self) -> String {
         format!("{GEMINI_API_BASE}/models/{}:generateContent", self.model)
     }
 
+    /// Builds the text instruction sent alongside the video file references.
+    ///
+    /// # Arguments
+    ///
+    /// * `window` - Analysis window whose timing and chunk range should be included in the prompt.
+    ///
+    /// # Returns
+    ///
+    /// Prompt text instructing Gemini to return structured general events.
     fn prompt(window: &AnalysisWindow) -> String {
         format!(
             "You are extracting general memory events from a wearable first-person video window.\n\
@@ -79,6 +148,11 @@ The window spans from {} to {} and covers chunk sequence numbers {} through {}."
         )
     }
 
+    /// Returns the JSON schema Gemini should use for structured event output.
+    ///
+    /// # Returns
+    ///
+    /// A JSON Schema value describing the expected array of general event objects.
     fn schema() -> Value {
         json!({
             "type": "array",
@@ -162,79 +236,131 @@ The window spans from {} to {} and covers chunk sequence numbers {} through {}."
     }
 }
 
+/// Request envelope for Gemini `generateContent`.
 #[derive(Debug, Serialize)]
 struct GenerateContentRequest {
+    /// Ordered content entries sent to the model.
     contents: Vec<Content>,
+    /// Response format and schema controls.
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
 }
 
+/// Gemini content container made of text and file parts.
 #[derive(Debug, Serialize)]
 struct Content {
+    /// Parts that make up a single content message.
     parts: Vec<Part>,
 }
 
+/// Individual Gemini content part.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum Part {
-    Text { text: String },
+    /// Plain text prompt part.
+    Text {
+        /// Text sent directly to the model.
+        text: String,
+    },
+    /// File reference part pointing Gemini at externally stored media.
     FileData {
+        /// Gemini file metadata for this part.
         #[serde(rename = "file_data")]
         file_data: FileData,
     },
 }
 
+/// Gemini file reference metadata.
 #[derive(Debug, Serialize)]
 struct FileData {
+    /// MIME type of the referenced file.
     mime_type: String,
+    /// URI for the referenced file.
     file_uri: String,
 }
 
+/// Gemini generation configuration for structured JSON output.
 #[derive(Debug, Serialize)]
 struct GenerationConfig {
+    /// Desired response MIME type.
     #[serde(rename = "responseMimeType")]
     response_mime_type: String,
+    /// JSON schema Gemini should satisfy.
     #[serde(rename = "responseJsonSchema")]
     response_json_schema: Value,
 }
 
+/// Gemini `generateContent` response envelope.
 #[derive(Debug, Deserialize)]
 struct GenerateContentResponse {
+    /// Candidate model responses, if any were produced.
     candidates: Option<Vec<Candidate>>,
 }
 
+/// One candidate response from Gemini.
 #[derive(Debug, Deserialize)]
 struct Candidate {
+    /// Candidate content payload.
     content: ContentResponse,
 }
 
+/// Content returned by Gemini.
 #[derive(Debug, Deserialize)]
 struct ContentResponse {
+    /// Parts returned in the candidate content.
     parts: Vec<PartResponse>,
 }
 
+/// One response part returned by Gemini.
 #[derive(Debug, Deserialize)]
 struct PartResponse {
+    /// JSON text emitted by the model.
     text: Option<String>,
 }
 
+/// Direct deserialization shape for Gemini-generated general events.
 #[derive(Debug, Deserialize)]
 struct RawGeneralEvent {
+    /// Event start timestamp.
     start_ts: DateTime<Utc>,
+    /// Event end timestamp.
     end_ts: DateTime<Utc>,
+    /// Broad event category.
     event_type: String,
+    /// Relative notability score from 0.0 to 1.0.
     importance: f32,
+    /// Location label produced by the model.
     location: String,
+    /// Activity phrase produced by the model.
     activity: String,
+    /// Salient objects named by the model.
     objects: Vec<String>,
+    /// Human-readable event summary.
     description: String,
+    /// Retrieval-oriented search text.
     search_text: String,
+    /// Model confidence score from 0.0 to 1.0.
     confidence: f32,
+    /// Suggested specialized follow-up extractors.
     trigger_candidates: Vec<String>,
 }
 
 #[async_trait]
 impl GeneralEventExtractor for GeminiExtractor {
+    /// Calls Gemini with the window media and converts its JSON output into events.
+    ///
+    /// # Arguments
+    ///
+    /// * `window` - Completed analysis window containing media URIs to send to Gemini.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`GeneralEvent`] values parsed from Gemini's JSON response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the window has no media URIs, the Gemini request fails, the response
+    /// envelope cannot be decoded, or the model output is not valid event JSON.
     async fn extract(&self, window: &AnalysisWindow) -> Result<Vec<GeneralEvent>> {
         if window.chunk_storage_uris.is_empty() {
             return Err(anyhow!("analysis window does not contain any chunk URIs"));
@@ -244,12 +370,18 @@ impl GeneralEventExtractor for GeminiExtractor {
         parts.push(Part::Text {
             text: Self::prompt(window),
         });
-        parts.extend(window.chunk_storage_uris.iter().cloned().map(|file_uri| Part::FileData {
-            file_data: FileData {
-                mime_type: "video/mp4".to_string(),
-                file_uri,
-            },
-        }));
+        parts.extend(
+            window
+                .chunk_storage_uris
+                .iter()
+                .cloned()
+                .map(|file_uri| Part::FileData {
+                    file_data: FileData {
+                        mime_type: "video/mp4".to_string(),
+                        file_uri,
+                    },
+                }),
+        );
 
         let request = GenerateContentRequest {
             contents: vec![Content { parts }],
